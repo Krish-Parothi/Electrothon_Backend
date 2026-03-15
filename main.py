@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from collections import deque
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone
-
+import yt_dlp
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -534,6 +534,138 @@ def search_video(payload: GlobalSearchRequest):
         "results": all_results[:payload.top_k]
     }
 
+
+class Request(BaseModel):
+    url: str
+
+def extract_video_id(url):
+    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})", url)
+    return match.group(1)
+
+def get_metadata(url):
+    ydl = yt_dlp.YoutubeDL({"quiet": True})
+    info = ydl.extract_info(url, download=False)
+
+    return {
+        "title": info["title"],
+        "description": info["description"],
+        "duration": info["duration"],
+        "thumbnail": info["thumbnail"]
+    }
+
+def create_clips(transcript):
+
+    clips = []
+    window = 20
+
+    for i in range(0, len(transcript), window):
+
+        start = transcript[i]["start"]
+        end = transcript[min(i+window-1, len(transcript)-1)]["start"]
+
+        text = " ".join(t["text"] for t in transcript[i:i+window])
+
+        score = min(100, 70 + len(text) % 30)
+
+        clips.append({
+            "id": f"clip-{i}",
+            "title": text[:60],
+            "start_time": int(start),
+            "end_time": int(end),
+            "score": score
+        })
+
+    return sorted(clips, key=lambda x: x["score"], reverse=True)[:10]
+
+
+@app.post("/extract")
+def extract(req: Request):
+
+    video_id = extract_video_id(req.url)
+
+    transcript = YouTubeTranscriptApi.get_transcript(video_id)
+
+    metadata = get_metadata(req.url)
+
+    clips = create_clips(transcript)
+
+    return {
+        "title": metadata["title"],
+        "description": metadata["description"],
+        "duration": metadata["duration"],
+        "platform": "YouTube",
+        "embedUrl": f"https://www.youtube.com/embed/{video_id}",
+        "thumbnailUrl": metadata["thumbnail"],
+        "clips": clips
+    }
+
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import google.generativeai as genai
+import os
+from dotenv import load_dotenv
+from PIL import Image
+from io import BytesIO
+
+load_dotenv()
+
+try:
+    api_key = os.environ["GEMINI_API_KEY"]
+    genai.configure(api_key=api_key)
+except KeyError:
+    raise RuntimeError("GEMINI_API_KEY not found in .env")
+
+model = genai.GenerativeModel(
+    model_name="gemini-2.0-flash-preview-image-generation"
+)
+
+generation_config = {
+    "response_modalities": ["TEXT", "IMAGE"]
+}
+
+
+class GenerateRequest(BaseModel):
+    event_name: str = "TechXperts 2025"
+    event_description: str = "A national-level hackathon bringing together innovators."
+
+
+@app.post("/generate")
+async def generate_image(payload: GenerateRequest):
+
+    try:
+        text_input = (
+            f"A futuristic, collectible NFT memento token for the event: '{payload.event_name}'.\n\n"
+            f"Core Concept: '{payload.event_description}'.\n\n"
+            "Object & Form: A distinct 2D illustrated token, symbolic coin, crystal, holographic card, or futuristic emblem.\n"
+            "Style: Futuristic, Web3, cyberpunk, neon gradients, vector-style, flat geometric.\n"
+            "Background: Minimalist dark abstract background.\n"
+            f"Text: Include '{payload.event_name}' subtly.\n"
+            "Avoid: 3D renders, photorealism, blurry, cartoonish, watermark."
+        )
+
+        response = model.generate_content(
+            contents=[text_input],
+            generation_config=generation_config
+        )
+
+        for part in response.candidates[0].content.parts:
+            if hasattr(part, "inline_data") and part.inline_data:
+                image_data = part.inline_data.data
+                image = Image.open(BytesIO(image_data))
+
+                img_io = BytesIO()
+                image.save(img_io, format="PNG")
+                img_io.seek(0)
+
+                return StreamingResponse(img_io, media_type="image/png")
+
+        raise HTTPException(status_code=500, detail="No image generated")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # import os
